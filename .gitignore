@@ -130,3 +130,6 @@ logs
 log
 outputs
 .history
+
+# flash attn
+*.whl
