@@ -63,17 +63,29 @@ if __name__ == "__main__":
             prompt = problem + " " + instruction_following
             answer = example.pop("answer")
             images = example.pop("images")
+
+            system_prompt = (
+                "You are an expert mathematical and geometric reasoner provided with an image. "
+                "Analyze the image step by step to solve the question. "
+                "\n\n**Available Tools**\n"
+                "You can use the `image_zoom_in_tool` to crop and zoom in on specific regions if details are unclear.\n"
+                "Tool Schema:\n"
+                "{\n"
+                "  \"name\": \"image_zoom_in_tool\",\n"
+                "  \"description\": \"Zoom in on a specific region of an image by cropping it based on a bounding box.\",\n"
+                "  \"parameters\": {\"bbox_2d\": \"[x1, y1, x2, y2] absolute pixel coordinates\", \"label\": \"optional string\"}\n"
+                "}\n\n"
+                "To use the tool, you MUST output exactly:\n"
+                "<tool_call> {\"name\": \"image_zoom_in_tool\", \"parameters\": {\"bbox_2d\": [x1, y1, x2, y2]}} </tool_call>\n"
+                "After receiving the observation and the new zoomed-in image, continue your reasoning. "
+            )
+
             data = {
                 "data_source": data_source,
                 "prompt": [
                     {
                         "role": "system",
-                        "content": (
-                            "You are a math expert. You are given a question and you need to solve it step by step. "
-                            "Reasoning step by step before any tool call. "
-                            "You should use the `calc_geo3k_reward` tool after step by step solving the question, "
-                            "before generate final answer at least once and refine your answer if necessary. "
-                        ),
+                        "content": system_prompt,
                     },
                     {
                         "role": "user",
@@ -88,13 +100,13 @@ if __name__ == "__main__":
                     "index": idx,
                     "answer": answer,
                     "question": problem,
+
                     "need_tools_kwargs": True,
+
                     "tools_kwargs": {
-                        "calc_geo3k_reward": {
-                            "create_kwargs": {"ground_truth": answer},
-                            # "execute_kwargs": {},
-                            # "calc_reward_kwargs": {},
-                            # "release_kwargs": {},
+                        "image_zoom_in_tool": {
+                            "class_path": "verl.tools.image_zoom_in_tool.ImageZoomInTool",
+                            "create_kwargs": {},
                         },
                     },
                 },
