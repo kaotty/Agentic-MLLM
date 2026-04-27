@@ -9,7 +9,7 @@ Run the following commands for installation:
 ```
 conda create -n verl python==3.12
 conda activate verl
-cd verl
+# cd verl
 bash scripts/install_vllm_sglang_mcore.sh
 ```
 

@@ -8,6 +8,8 @@
 **/playground
 **/wandb
 
+/sft/sft_dataset/
+
 /pyrightconfig.json
 
 # Byte-compiled / optimized / DLL files
