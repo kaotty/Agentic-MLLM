@@ -1,0 +1,24 @@
+tools:
+  - class_name: "verl.tools.image_search_tool.ImageSearchTool"
+    config:
+      num_workers: 20
+      enable_global_rate_limit: true
+      rate_limit: 20
+      # Path(s) to pre-built JSON cache files from DeepEyesV2_Search_Cache.
+      # Each file maps data_idx -> {tool_returned_web_title, cached_images_path}.
+      # Download from: https://huggingface.co/datasets/honglyhly/DeepEyesV2_Search_Cache
+      cache_json_paths: []
+      # Optional: set to enable live SerpAPI reverse-image search instead of cache.
+      # Can also be set via SERPAPI_KEY environment variable.
+      serpapi_key: null
+      max_results: 5
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "image_search"
+        description: "Performs a reverse image search using the most recent image in the conversation, returning visually similar web results with thumbnail images and source titles."
+        parameters:
+          type: "object"
+          properties: {}
+          required: []

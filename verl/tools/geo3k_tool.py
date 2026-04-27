@@ -65,10 +65,16 @@ class Geo3kTool(BaseTool):
         return self.tool_schema
 
     async def create(
-        self, instance_id: Optional[str] = None, ground_truth: Optional[str] = None, **kwargs
+        self, instance_id: Optional[str] = None, **kwargs
     ) -> tuple[str, ToolResponse]:
         if instance_id is None:
             instance_id = str(uuid4())
+
+        create_kwargs = kwargs.get("create_kwargs", {})
+        if create_kwargs:
+            kwargs.update(create_kwargs)
+        ground_truth: Optional[str] = kwargs.get("ground_truth")
+
         self._instance_dict[instance_id] = {
             "response": "",
             "ground_truth": ground_truth,

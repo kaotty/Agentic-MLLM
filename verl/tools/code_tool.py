@@ -25,7 +25,7 @@ from PIL import Image
 
 # --- Assume these imports are available in the environment ---
 from .base_tool import BaseTool
-from .schemas import OpenAIFunctionToolSchema
+from .schemas import OpenAIFunctionToolSchema, ToolResponse
 # --- End Mock ---
 from verl.utils.dataset.vision_utils import process_image
 
@@ -562,6 +562,33 @@ def worker_main_loop(task_queue: Queue, result_queue: Queue):
         finally:
             gc.collect()
 
+def _content_list_to_tool_response(content: List[Dict[str, str]]) -> ToolResponse:
+    """Convert the internal ``[{"type": "text"/"image", ...}]`` list into a
+    ``ToolResponse`` so that ``ToolAgentLoop`` can consume it.
+
+    Image items are base64 data-URI strings from the worker process;
+    we decode them back to PIL Images so the agent loop can pass them
+    to ``apply_chat_template(images=...)`` which expects ``list[Image.Image]``.
+    """
+    text_parts: List[str] = []
+    images: List[Any] = []
+    for item in content:
+        if item.get("type") == "image":
+            raw = item.get("image")
+            if raw and isinstance(raw, str) and raw.startswith("data:image"):
+                _, b64data = raw.split(",", 1)
+                img = Image.open(io.BytesIO(base64.b64decode(b64data)))
+                images.append(img)
+            elif raw is not None:
+                images.append(raw)
+        elif item.get("type") == "text":
+            text_parts.append(item.get("text", ""))
+    resp_kwargs: Dict[str, Any] = {"text": "\n".join(text_parts) if text_parts else None}
+    if images:
+        resp_kwargs["image"] = images
+    return ToolResponse(**resp_kwargs)
+
+
 # --- Main Tool Class ---
 class CodeExecuteTool(BaseTool):
     def __init__(self, config: dict, tool_schema: Optional[OpenAIFunctionToolSchema] = None):
@@ -646,11 +673,17 @@ class CodeExecuteTool(BaseTool):
             self.pending_futures.pop(request_id, None)
             raise
 
-    async def create(self, instance_id: Optional[str] = None, image: Optional[Union[Image.Image, str, dict]] = None, **kwargs) -> str:
+    async def create(self, instance_id: Optional[str] = None, **kwargs) -> Tuple[str, ToolResponse]:
         """Creates a new execution instance and assigns it to a worker."""
         if instance_id is None:
             instance_id = str(uuid4())
             print("New instance_id:", instance_id)
+
+        create_kwargs = kwargs.get("create_kwargs", {})
+        if create_kwargs:
+            kwargs.update(create_kwargs)
+        image: Optional[Union[Image.Image, str, dict]] = kwargs.get("image")
+
         log_extra = {'instance_id': instance_id}
         if instance_id in self._instance_dict:
             logger.warning(f"Instance '{instance_id}' already exists. Releasing old one first.", extra=log_extra)
@@ -684,15 +717,15 @@ class CodeExecuteTool(BaseTool):
         # Store extra metadata so execute() can forward it.
         self._instance_dict[instance_id]["image_path"] = image_path
 
-        return instance_id
+        return instance_id, ToolResponse()
 
-    async def execute(self, instance_id: str, parameters: Dict[str, Any], **kwargs) -> Tuple[Dict[str, List[Dict[str, str]]], float, Dict[str, Any]]:
+    async def execute(self, instance_id: str, parameters: Dict[str, Any], **kwargs) -> Tuple[ToolResponse, float, Dict[str, Any]]:
         """Executes code for an instance in its assigned worker process."""
         log_extra = {'instance_id': instance_id}
 
         if instance_id not in self._instance_dict:
             error_msg = f"Error: Instance '{instance_id}' not found. Please create it first."
-            return {"content": [{"type": "text", "text": error_msg}]}, 0.0, {"execution_successful": False, "error": "Instance not found"}
+            return ToolResponse(text=error_msg), 0.0, {"execution_successful": False, "error": "Instance not found"}
 
         instance_data = self._instance_dict[instance_id]
         worker_id = instance_data["worker_id"]
@@ -701,7 +734,7 @@ class CodeExecuteTool(BaseTool):
         code = parameters.get("code", "")
         if not isinstance(code, str) or not code.strip():
             error_msg = "Error: No code provided to execute."
-            return {"content": [{"type": "text", "text": error_msg}]}, 0.0, {"execution_successful": False, "error": "No code provided"}
+            return ToolResponse(text=error_msg), 0.0, {"execution_successful": False, "error": "No code provided"}
 
         try:
             timeout_seconds = float(parameters.get("timeout", os.getenv("CODE_EXECUTION_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))))
@@ -789,7 +822,7 @@ class CodeExecuteTool(BaseTool):
         if not result_content:
              result_content.append({"type": "text", "text": "Execution finished, but no specific result or error was generated."})
 
-        return {"content": result_content}, reward, metadata
+        return _content_list_to_tool_response(result_content), reward, metadata
     
     async def release(self, instance_id: str, **kwargs) -> None:
         """Releases resources associated with an instance."""
@@ -1009,7 +1042,7 @@ if __name__ == '__main__':
         # syntactic correctness without affecting library functionality.
         # try:
         # --- Instance 1: Plotting and context sharing ---
-        inst1_id = await tool.create()
+        inst1_id, _ = await tool.create()
         print(f"\n--- Test Case: Instance 1 ({inst1_id}) ---")
 
         code1_part1 = """
@@ -1032,11 +1065,10 @@ while True:
 """
         res1_part1, reward1_part1, meta1_part1 = await tool.execute(inst1_id, {"code": code1_part1})
         print(f"Instance 1, Part 1 Result (Reward: {reward1_part1}): {meta1_part1}")
-        for item in res1_part1['content']:
-            content_preview = item.get('text', item.get('image', ''))
-            if item['type'] == 'image':
-                content_preview = content_preview[:70] + '...'
-            print(f"  Output Type: {item['type']}, Content: {content_preview}")
+        if res1_part1.text:
+            print(f"  Text: {res1_part1.text[:200]}")
+        if res1_part1.image:
+            print(f"  Images: {len(res1_part1.image)}")
 
         code1_part2 = """
 import matplotlib.pyplot as plt
@@ -1057,17 +1089,16 @@ plt.show()
 """
         res1_part2, reward1_part2, meta1_part2 = await tool.execute(inst1_id, {"code": code1_part2})
         print(f"Instance 1, Part 2 Result (Reward: {reward1_part2}): {meta1_part2}")
-        for item in res1_part2['content']:
-            content_preview = item.get('text', item.get('image', ''))
-            if item['type'] == 'image':
-                content_preview = content_preview[:70] + '...'
-            print(f"  Output Type: {item['type']}, Content: {content_preview}")
+        if res1_part2.text:
+            print(f"  Text: {res1_part2.text[:200]}")
+        if res1_part2.image:
+            print(f"  Images: {len(res1_part2.image)}")
 
 
         # --- Instance 2: Image input ---
         from PIL import Image
         dummy_img_data = Image.new('RGB', (1024, 1024), color = 'red')
-        inst2_id = await tool.create(image=dummy_img_data)
+        inst2_id, _ = await tool.create(image=dummy_img_data)
         print(f"\n--- Test Case: Instance 2 ({inst2_id}) with image input ---")
 
         code_img_proc = (
@@ -1081,11 +1112,10 @@ sub_img
         )
         res_img, reward_img, meta_img = await tool.execute(inst2_id, {"code": code_img_proc})
         print(f"Instance 2 Image Proc Result (Reward: {reward_img}): {meta_img}")
-        for item in res_img['content']:
-            content_preview = item.get('text', item.get('image', ''))
-            if item['type'] == 'image':
-                content_preview = content_preview
-            print(f"  Output Type: {item['type']}, Content: {content_preview}")
+        if res_img.text:
+            print(f"  Text: {res_img.text[:200]}")
+        if res_img.image:
+            print(f"  Images: {len(res_img.image)}")
 
 
         code_img_proc1 = ("""from PIL import Image
@@ -1115,12 +1145,10 @@ result_img
         """)
         res_img, reward_img, meta_img = await tool.execute(inst2_id, {"code": code_img_proc1})
         print(f"Instance 2 Image Proc Result----------double (Reward: {reward_img}): {meta_img}")
-
-        for item in res_img['content']:
-            content_preview = item.get('text', item.get('image', ''))
-            if item['type'] == 'image':
-                content_preview = content_preview
-            print(f"  Output Type: {item['type']}, Content: {content_preview}")
+        if res_img.text:
+            print(f"  Text: {res_img.text[:200]}")
+        if res_img.image:
+            print(f"  Images: {len(res_img.image)}")
 
         # except Exception as e:
         #      logging.exception("An error occurred during the test execution.")
