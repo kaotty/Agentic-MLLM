@@ -34,3 +34,8 @@ For the baseline w/ tool use, run the following commands:
 python examples/data_preprocess/geo3k_multiturn_w_tool.py
 ./examples/sglang_multiturn/geo3k/run_qwen2_5_vl_7b_geo3k_multiturn.sh
 ```
+
+# SFT
+SFT data is from DeepEyesV2.
+To adapt to our pipeline, we transfered the data schema.
+Check sft/README.md for details.
