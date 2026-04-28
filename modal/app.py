@@ -14,9 +14,12 @@ See ``modal/README.md`` for the end-to-end walk-through.
 
 from __future__ import annotations
 
+from collections import deque
+from datetime import datetime, timezone
+import json
 import os
-import subprocess
 from pathlib import Path
+import subprocess
 
 import modal
 
@@ -54,17 +57,68 @@ VOL_HF = modal.Volume.from_name("agentic-mllm-hf-cache", create_if_missing=True)
 # triggers a fast layer rebuild (not a full reinstall).
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04",
+        # torch==2.9.1 resolves to the CUDA 12.8 wheel (`+cu128`). SGLang
+        # scheduler subprocesses import torch after CUDA library paths are set,
+        # so a CUDA 12.4 base image can make them load the older system
+        # libcudart.so.12 first and crash with:
+        # `undefined symbol: cudaGetDriverEntryPointByVersion`.
+        "nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04",
         add_python="3.12",
     )
-    .apt_install("git", "wget", "build-essential", "ninja-build", "libgl1", "libglib2.0-0")
+    .apt_install(
+        "git",
+        "wget",
+        "build-essential",
+        "ninja-build",
+        "libgl1",
+        "libglib2.0-0",
+        # libnuma1 is REQUIRED at import time by sgl_kernel (sglang's C++ kernel
+        # backend). Without it, `import sglang.srt.entrypoints.engine` raises
+        # `ImportError: libnuma.so.1: cannot open shared object file`, which
+        # crashes the rollout init in `rl_diverse` before training even starts.
+        "libnuma1",
+        # veRL's NUMA affinity helper loads the unversioned soname via
+        # ctypes.CDLL("libnuma.so"), which is provided by the dev package.
+        "libnuma-dev",
+    )
     .pip_install("packaging", "wheel", "setuptools>=61.0", "ninja")
-    # Inference frameworks. Skip Megatron (USE_MEGATRON=0 in the install script's spirit).
+    # Pin torch == 2.9.1 BEFORE sglang so that pip doesn't downgrade us. sglang
+    # 0.5.8's prebuilt sgl_kernel wheel is compiled against torch 2.9's C++ ABI
+    # (specifically the `c10::SymInt::maybe_as_int_slow_path` symbol introduced
+    # in 2.9). Any older torch -> sgl_kernel fails to load with
+    # `undefined symbol: _ZNK3c106SymInt22maybe_as_int_slow_pathEv`.
+    # 2.9.1 is what sglang 0.5.8 itself strict-pins (`torch==2.9.1`); using the
+    # exact same version avoids pip wasting a pass upgrading us during the
+    # sglang install.
+    .pip_install("torch==2.9.1", "torchvision", "torchaudio")
+    # Inference framework: sglang only.
+    # NB: scripts/install_vllm_sglang_mcore.sh pins sglang==0.5.2, but the verl
+    # source in this fork already calls into the newer pause/continue-generation
+    # API (`ContinueGenerationReqInput`, `PauseGenerationReqInput` in
+    # async_sglang_server.py), which only exists in sglang>=0.5.5. The install
+    # script lags the source. Pin to 0.5.8 to match setup.py and
+    # requirements_sglang.txt.
+    #
+    # We deliberately DO NOT install vllm:
+    #  - We always run `actor_rollout_ref.rollout.name=sglang`, so vllm is never
+    #    loaded at runtime.
+    #  - Every `import vllm` in this fork lives under `verl/workers/rollout/
+    #    vllm_rollout/*` (only reached by `_load_vllm`), `verl/utils/vllm/*`
+    #    (only imported transitively from vllm_rollout), or in two checkpoint
+    #    engines (`hccl_checkpoint_engine.py`, `mooncake_checkpoint_engine.py`)
+    #    whose imports are wrapped in try/except in `verl/checkpoint_engine/
+    #    __init__.py`.
+    #  - `_load_sglang` already injects a mock `vllm` module if `import vllm`
+    #    fails, so the sglang rollout path works without vllm installed.
+    #  - vllm 0.11.0 hard-pins `torch==2.8.0`, vllm 0.11.1/0.11.2/0.12.0 pin
+    #    `torch==2.9.0`, but sglang 0.5.8 pins `torch==2.9.1`. There is no vllm
+    #    version whose torch pin is compatible with our pinned sglang, so any
+    #    attempt to coinstall the two silently downgrades torch and breaks
+    #    sgl_kernel + flash_attn ABI.
     .pip_install(
-        "sglang[all]==0.5.2",
+        "sglang==0.5.8",
         "torch-memory-saver",
     )
-    .pip_install("vllm==0.11.0")
     # Core deps from scripts/install_vllm_sglang_mcore.sh.
     .pip_install(
         "transformers[hf_xet]>=4.51.0",
@@ -78,6 +132,7 @@ image = (
         "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
         "torchdata",
         "ray[default]",
+        "cachetools",
         "codetiming",
         "hydra-core",
         "pylatexenc",
@@ -92,15 +147,37 @@ image = (
         "optree>=0.13.0",
         "pydantic>=2.9",
         "grpcio>=1.62.1",
+        # Code-interpreter sandbox dependencies. `verl/tools/code_tool.py`'s
+        # `worker_main_loop` unconditionally imports matplotlib (for plotting,
+        # forced to the 'Agg' backend) and cv2 (for image processing); without
+        # these every CodeExecWorker dies on startup with ModuleNotFoundError
+        # and the `code_interpreter` tool becomes a no-op. scipy/sympy are
+        # commonly emitted by the model for geometry problems on Geo3K, so we
+        # ship them too rather than fail the first time a tool call uses them.
+        "matplotlib",
+        "opencv-python-headless",
+        "scipy",
+        "sympy",
     )
-    # Flash-Attention 2.8.1 prebuilt wheel (cu12 + torch2.8 + python3.12).
+    # Flash-Attention prebuilt wheel matched to torch 2.9.
+    # IMPORTANT: torch 2.9 on Linux x86_64 ships C++11 ABI = TRUE by default
+    # (manylinux_2_28), so we MUST pick the `cxx11abiTRUE` wheel. Picking the
+    # abiFALSE wheel will load but crash later with std::string ABI mismatches.
     # NB: pip validates the wheel filename against PEP 427, so we MUST NOT
     # rename it via ``wget -O``. Pass the URL directly to pip instead.
     .pip_install(
-        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/"
-        "flash_attn-2.8.1+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl",
+        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/"
+        "flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
     )
-    .pip_install("flashinfer-python==0.3.1")
+    # SGLang 0.5.8 refuses to start with torch 2.9.1 + CuDNN < 9.15 because of
+    # a known PyTorch Conv3d/CuDNN regression. Install this after torch/sglang
+    # so the newer Python CuDNN wheel wins over torch's transitive default.
+    .pip_install("nvidia-cudnn-cu12==9.16.0.29")
+    # NB: don't pin flashinfer-python here. sglang==0.5.8 already pulls in
+    # flashinfer_python==0.6.1 (matching sgl_kernel==0.3.21's compiled ABI).
+    # The previous explicit pin to 0.3.1 came from an older sglang==0.5.2 setup
+    # in scripts/install_vllm_sglang_mcore.sh, and would silently DOWNGRADE
+    # flashinfer back to 0.3.1, which breaks sgl_kernel at runtime.
     # Bring the repo into the image.
     .add_local_dir(str(LOCAL_REPO_ROOT), WORKSPACE, copy=True, ignore=["sft/sft_dataset/*"])
     # Install verl in-place so ``python -m verl.trainer.sft_trainer`` resolves.
@@ -122,14 +199,154 @@ app = modal.App(APP_NAME, image=image)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _run(cmd: list[str] | str, env: dict | None = None, cwd: str = WORKSPACE) -> None:
+def _run(
+    cmd: list[str] | str,
+    env: dict | None = None,
+    cwd: str = WORKSPACE,
+    log_path: str | Path | None = None,
+) -> None:
     """Run a subprocess and stream its output. Raise on non-zero exit."""
     print(f"\n$ {cmd}\n", flush=True)
     full_env = {**os.environ, **(env or {})}
-    if isinstance(cmd, str):
-        subprocess.check_call(cmd, shell=True, env=full_env, cwd=cwd)
-    else:
-        subprocess.check_call(cmd, env=full_env, cwd=cwd)
+    if log_path is None:
+        if isinstance(cmd, str):
+            subprocess.check_call(cmd, shell=True, env=full_env, cwd=cwd)
+        else:
+            subprocess.check_call(cmd, env=full_env, cwd=cwd)
+        return
+
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8", buffering=1) as log:
+        log.write("\n" + "=" * 100 + "\n")
+        log.write(f"{datetime.now(timezone.utc).isoformat()} cwd={cwd}\n")
+        log.write(f"$ {cmd}\n\n")
+
+        process = subprocess.Popen(
+            cmd,
+            shell=isinstance(cmd, str),
+            env=full_env,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            log.write(line)
+
+        retcode = process.wait()
+        log.write(f"\n[exit status: {retcode}]\n")
+        if retcode:
+            raise subprocess.CalledProcessError(retcode, cmd)
+
+
+def _repair_qwen25vl_config(model_dir: str | Path) -> None:
+    """Repair Qwen2.5-VL merged checkpoints whose root config is saved as text-only."""
+    model_dir = Path(model_dir)
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        print(f"HF config not found, skipping Qwen2.5-VL config repair: {config_path}", flush=True)
+        return
+
+    with config_path.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    old_model_type = cfg.get("model_type")
+    changed = False
+
+    # The nested text_config is expected to have model_type=qwen2_5_vl_text. The
+    # root config must remain qwen2_5_vl so SGLang's multimodal rope code takes
+    # the Qwen2.5-VL path instead of raising "Unimplemented model type".
+    if old_model_type == "qwen2_5_vl_text":
+        cfg["model_type"] = "qwen2_5_vl"
+        changed = True
+
+    if cfg.get("model_type") == "qwen2_5_vl":
+        expected_arch = ["Qwen2_5_VLForConditionalGeneration"]
+        if cfg.get("architectures") != expected_arch:
+            cfg["architectures"] = expected_arch
+            changed = True
+
+    if not changed:
+        print(
+            f"HF config OK: model_type={cfg.get('model_type')} architectures={cfg.get('architectures')}",
+            flush=True,
+        )
+        return
+
+    backup_path = config_path.with_suffix(".json.before_qwen25vl_repair")
+    if not backup_path.exists():
+        backup_path.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    with config_path.open("w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+    print(
+        "Repaired HF config: "
+        f"{config_path} model_type {old_model_type!r} -> {cfg.get('model_type')!r}, "
+        f"architectures={cfg.get('architectures')}",
+        flush=True,
+    )
+
+
+def _patch_sglang_qwen25vl_text_rope(log_path: str | Path | None = None) -> None:
+    """Patch SGLang 0.5.x to treat Qwen2.5-VL's text_config type as Qwen2.5-VL."""
+    script = "\n".join([
+        "from pathlib import Path",
+        "import importlib.util",
+        "import sglang.srt.layers.rotary_embedding as rotary_embedding",
+        "path = Path(rotary_embedding.__file__)",
+        "text = path.read_text(encoding='utf-8')",
+        "marker = '# Agentic-MLLM compatibility: Qwen2.5-VL text_config model type'",
+        "if marker in text:",
+        "    print(f'SGLang Qwen2.5-VL RoPE text_config patch already present in {path}', flush=True)",
+        "    raise SystemExit(0)",
+        "if '\"qwen2_5_vl\"' in text or \"'qwen2_5_vl'\" in text:",
+        "    target_model_type = 'qwen2_5_vl'",
+        "elif '\"qwen2_vl\"' in text or \"'qwen2_vl'\" in text:",
+        "    target_model_type = 'qwen2_vl'",
+        "else:",
+        "    raise RuntimeError(f'Could not find a Qwen-VL branch to patch in {path}')",
+        "lines = text.splitlines(keepends=True)",
+        "start = None",
+        "for i, line in enumerate(lines):",
+        "    if line.lstrip().startswith('def get_rope_index('):",
+        "        start = i",
+        "        break",
+        "if start is None:",
+        "    raise RuntimeError(f'Could not find get_rope_index in {path}')",
+        "balance = 0",
+        "end = None",
+        "for i in range(start, len(lines)):",
+        "    balance += lines[i].count('(') - lines[i].count(')')",
+        "    if balance <= 0 and lines[i].rstrip().endswith(':'):",
+        "        end = i",
+        "        break",
+        "if end is None:",
+        "    raise RuntimeError(f'Could not find get_rope_index signature end in {path}')",
+        "def_indent = lines[start][:len(lines[start]) - len(lines[start].lstrip())]",
+        "body_indent = def_indent + '    '",
+        "insert = [",
+        "    f'{body_indent}{marker}\\n',",
+        "    f'{body_indent}if model_type in (\\'qwen2_5_vl\\', \\'qwen2_5_vl_text\\'):\\n',",
+        "    f'{body_indent}    model_type = {target_model_type!r}\\n',",
+        "]",
+        "lines[end + 1:end + 1] = insert",
+        "path.write_text(''.join(lines), encoding='utf-8')",
+        "cache_path = Path(importlib.util.cache_from_source(str(path)))",
+        "cache_path.unlink(missing_ok=True)",
+        "print(",
+        "    f'Patched SGLang Qwen2.5-VL RoPE text_config support in {path}: '",
+        "    f'qwen2_5_vl_text -> {target_model_type}',",
+        "    flush=True,",
+        ")",
+    ])
+    _run(["python3", "-c", script], log_path=log_path)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +454,7 @@ def merge_ckpt(
             "--target_dir", dst,
         ],
     )
+    _repair_qwen25vl_config(dst)
     VOL_CKPT.commit()
     _run(f"ls -la {dst}")
     print(f"\nMerged HF model written to {dst}")
@@ -285,6 +503,7 @@ def rl_diverse(
     train_batch_size: int = 512,
     save_freq: int = 50,
     test_freq: int = 25,
+    resume_mode: str = "auto",
 ) -> None:
     """GRPO with the diverse 4-tool config, initialized from the SFT-merged ckpt."""
     sft_hf = f"{CKPT_DIR}/{sft_exp_name}/hf_merged"
@@ -293,11 +512,14 @@ def rl_diverse(
             f"SFT-merged checkpoint not found at {sft_hf}. "
             f"Run merge_ckpt first."
         )
+    _repair_qwen25vl_config(sft_hf)
+    VOL_CKPT.commit()
 
     cfg_path = f"{WORKSPACE}/examples/sglang_multiturn/config"
     tool_cfg = f"{cfg_path}/tool_config/deepeyesv2_diverse_config.yaml"
     reward_path = f"{WORKSPACE}/verl/utils/reward_score/geo3k_w_tools.py"
     ckpt_home = f"{CKPT_DIR}/rl/{rl_exp_name}"
+    log_path = f"{ckpt_home}/logs/rl_diverse.log"
 
     cmd = " \\\n    ".join([
         "python3 -m verl.trainer.main_ppo",
@@ -307,7 +529,7 @@ def rl_diverse(
         "custom_reward_function.name=compute_score",
         "algorithm.adv_estimator=grpo",
         f"data.train_batch_size={train_batch_size}",
-        "data.max_prompt_length=2048",
+        "data.max_prompt_length=4096",
         "data.max_response_length=2048",
         "data.filter_overlong_prompts=True",
         "data.truncation=error",
@@ -347,10 +569,12 @@ def rl_diverse(
         f"trainer.test_freq={test_freq}",
         f'trainer.default_local_dir="{ckpt_home}"',
         "trainer.ray_wait_register_center_timeout=300",
-        "trainer.resume_mode=auto",
+        f"trainer.resume_mode={resume_mode}",
         f"trainer.total_epochs={epochs}",
     ])
     env = {
+        "HYDRA_FULL_ERROR": "1",
+        "RAY_DEDUP_LOGS": "0",
         "SGLANG_WATCHDOG_TIMEOUT": "1800",
         # search tool reads this; empty string → soft-fail mode.
         "SEARCH_SERVICE_URL": "",
@@ -360,8 +584,80 @@ def rl_diverse(
         # so that this run uses exactly the same reward shaping as every other
         # cell in the 2×3 ablation.
     }
-    _run(f"ulimit -n 65535 && {cmd}", env=env)
-    VOL_CKPT.commit()
+    print(f"\nRL subprocess log will be written to {log_path}", flush=True)
+    try:
+        _patch_sglang_qwen25vl_text_rope(log_path=log_path)
+        _run(
+            [
+                "python3",
+                "-c",
+                "\n".join([
+                    "import importlib",
+                    "import importlib.metadata as md",
+                    "import json",
+                    f"cfg=json.load(open({str(Path(sft_hf) / 'config.json')!r}))",
+                    "print(f\"hf_config model_type={cfg.get('model_type')} architectures={cfg.get('architectures')}\", flush=True)",
+                    "import torch",
+                    "print(f'torch=={torch.__version__} cuda={torch.version.cuda}', flush=True)",
+                    "print(f'cudnn={torch.backends.cudnn.version()}', flush=True)",
+                    "for mod in ['cachetools', 'sglang', 'sglang.srt.entrypoints.engine', 'sgl_kernel', 'flashinfer', 'flash_attn']:",
+                    "    importlib.import_module(mod)",
+                    "    print(f'import ok: {mod}', flush=True)",
+                    "for pkg in ['sglang', 'sgl-kernel', 'flashinfer-python', 'flash-attn', 'transformers', 'torch', 'nvidia-cudnn-cu12']:",
+                    "    print(f'{pkg}=={md.version(pkg)}', flush=True)",
+                ]),
+            ],
+            env=env,
+            log_path=log_path,
+        )
+        _run(f"ulimit -n 65535 && {cmd}", env=env, log_path=log_path)
+    finally:
+        VOL_CKPT.commit()
+        print(f"\nCommitted checkpoint volume. RL log path: {log_path}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# 5b. Debug helper: inspect the persisted RL log and resume tracker
+# ---------------------------------------------------------------------------
+
+@app.function(
+    timeout=10 * 60,
+    volumes={CKPT_DIR: VOL_CKPT},
+)
+def tail_rl_log(
+    rl_exp_name: str = "qwen2_5_vl_7b_rl_diverse_after_sft",
+    lines: int = 300,
+) -> None:
+    """Print the tail of the persisted rl_diverse log and checkpoint tracker."""
+    ckpt_home = Path(CKPT_DIR) / "rl" / rl_exp_name
+    log_path = ckpt_home / "logs" / "rl_diverse.log"
+    tracker_path = ckpt_home / "latest_checkpointed_iteration.txt"
+
+    print(f"checkpoint dir: {ckpt_home}")
+    if tracker_path.exists():
+        step = tracker_path.read_text(encoding="utf-8").strip()
+        print(f"resume tracker: {tracker_path} -> global_step_{step}")
+    else:
+        print(f"resume tracker missing: {tracker_path}")
+
+    if ckpt_home.exists():
+        global_steps = sorted(p.name for p in ckpt_home.glob("global_step_*"))
+        print(f"global_step dirs: {global_steps[-10:] if global_steps else []}")
+    else:
+        print("checkpoint dir does not exist yet")
+
+    print(f"\nlog path: {log_path}")
+    if not log_path.exists():
+        print("log file does not exist yet")
+        return
+
+    tail = deque(maxlen=max(1, lines))
+    with log_path.open("r", encoding="utf-8", errors="replace") as f:
+        tail.extend(f)
+
+    print(f"\n--- last {len(tail)} lines ---")
+    for line in tail:
+        print(line, end="")
 
 
 # ---------------------------------------------------------------------------

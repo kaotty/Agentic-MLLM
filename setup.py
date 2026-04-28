@@ -25,6 +25,7 @@ with open(os.path.join(version_folder, "verl/version/version")) as f:
 
 install_requires = [
     "accelerate",
+    "cachetools",
     "codetiming",
     "datasets",
     "dill",
