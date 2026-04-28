@@ -172,12 +172,24 @@ class SearchTool(BaseTool):
             mode=PoolMode.ThreadMode,
         )
 
-        # Retrieval service configuration
-        self.retrieval_service_url = config.get("retrieval_service_url")
-        assert self.retrieval_service_url, "Configuration must include 'retrieval_service_url'"
+        # Retrieval service configuration.
+        # If retrieval_service_url is empty/None, the tool runs in "soft-fail" mode:
+        # ``execute`` returns a static "service unavailable" message instead of crashing
+        # the whole RL pipeline. This lets us expose the full DeepEyesV2 tool schema
+        # (so the model sees the same 4-tool menu it saw at SFT time) on tasks like
+        # Geo3K where a real retrieval backend is not set up.
+        self.retrieval_service_url = config.get("retrieval_service_url") or None
         self.topk = config.get("topk", 3)
-        if self.retrieval_service_url == "":
-            raise ValueError("retrieval_service_url is not set")
+        self._soft_fail_message = config.get(
+            "soft_fail_message",
+            "Search service is not configured for this run; please reason without web search.",
+        )
+
+        if not self.retrieval_service_url:
+            logger.warning(
+                "[SearchTool] retrieval_service_url is empty. Tool will run in soft-fail mode "
+                "and return a fixed 'service unavailable' message on every call."
+            )
 
         logger.info(f"Initialized SearchTool with config: {config}")
 
@@ -246,6 +258,14 @@ class SearchTool(BaseTool):
             error_msg = "Error: 'query_list' is missing, empty, or not a list in parameters."
             logger.error(f"[SearchTool] {error_msg} Received parameters: {parameters}")
             return ToolResponse(text=json.dumps({"result": error_msg})), 0.0, {}
+
+        # Soft-fail mode: no retrieval backend configured.
+        if not self.retrieval_service_url:
+            return (
+                ToolResponse(text=self._soft_fail_message),
+                0.0,
+                {"status": "soft_fail", "backend": "none"},
+            )
 
         # Execute search using Ray execution pool
         try:

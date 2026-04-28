@@ -42,6 +42,11 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+class _SkipSample(Exception):
+    """Internal signal: this sample cannot be served at the configured
+    max_length without corrupting multimodal alignment; resample another."""
+
+
 def once(func):
     """Decorator to ensure a function runs only once. Subsequent calls do nothing."""
 
@@ -141,12 +146,40 @@ class MultiTurnSFTDataset(Dataset):
                 ls = ls[0]
             return ls
 
-        dataframes = []
+        # The default ``pd.read_parquet`` loader turns nested-list columns into
+        # ``np.ndarray``, which then breaks the tokenizer downstream (the
+        # processor expects plain Python lists/dicts). The previous fix here used
+        # ``pd.read_parquet(..., dtype_backend="pyarrow")`` to preserve nested
+        # types, but that path falls over on large parquets with deeply nested
+        # columns in **two** different ways:
+        #
+        #   1. Reading: ``ArrowNotImplementedError: Nested data conversions not
+        #      implemented for chunked array outputs`` — pyarrow chunks columns
+        #      once total bytes >2GB and can't convert chunked nested arrays
+        #      back to pandas.
+        #   2. Indexing: even when reading is split across batches, the resulting
+        #      concat'd ArrowDtype-backed DataFrame has multi-chunk columns, and
+        #      ``self.dataframe.iloc[item]`` in ``__getitem__`` aborts with
+        #      ``Slice offset (N) > array length (batch_size)`` whenever ``item``
+        #      crosses a chunk boundary.
+        #
+        # Workaround: stream the parquet via ``ParquetFile.iter_batches`` and
+        # convert each (small) batch to **native Python** records via
+        # ``RecordBatch.to_pylist()``. Then assemble a single object-dtype
+        # ``pd.DataFrame`` from the records. This gives us:
+        #   * Python lists/dicts for every nested field (tokenizer-friendly),
+        #   * a contiguous, single-chunk DataFrame (iloc-friendly),
+        #   * one consistent code path regardless of parquet row-group layout.
+        # Memory cost is modestly higher than ArrowDtype (~2-3x), which is a
+        # non-issue on the training-node RAM budget.
+        import pyarrow.parquet as pq
+
+        records: list[dict] = []
         for parquet_file in self.parquet_files:
-            # default loader loads some list as np.ndarray, which fails the tokenizer
-            dataframe = pd.read_parquet(parquet_file, dtype_backend="pyarrow")
-            dataframes.append(dataframe)
-        self.dataframe = pd.concat(dataframes)
+            pf = pq.ParquetFile(parquet_file)
+            for batch in pf.iter_batches(batch_size=500):
+                records.extend(batch.to_pylist())
+        self.dataframe = pd.DataFrame.from_records(records)
 
         total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")
@@ -287,6 +320,30 @@ class MultiTurnSFTDataset(Dataset):
         return messages
 
     def __getitem__(self, item):
+        # Resolve the requested index, skipping over multimodal samples that
+        # cannot be honoured at the configured max_length. We loop instead of
+        # recurse so that pathological data won't blow the Python stack.
+        original_item = item
+        attempts = 0
+        n = len(self)
+        while True:
+            attempts += 1
+            if attempts > n:
+                raise RuntimeError(
+                    f"All {n} samples are unusable at max_length={self.max_length}; "
+                    "increase data.max_length or filter the dataset."
+                )
+            try:
+                return self._getitem_one(item)
+            except _SkipSample:
+                item = (item + 1) % n
+                if item == original_item:
+                    raise RuntimeError(
+                        f"All {n} samples are unusable at max_length={self.max_length}; "
+                        "increase data.max_length or filter the dataset."
+                    )
+
+    def _getitem_one(self, item):
         row_dict: dict = self.dataframe.iloc[item].to_dict()
         messages = self._build_messages(row_dict)
         tools = self.tools[item] if self.tools is not None else None
@@ -358,6 +415,24 @@ class MultiTurnSFTDataset(Dataset):
 
         # 3. handle padding
         sequence_length = input_ids.shape[0]
+
+        # Multimodal-truncation guard:
+        # When images/videos are present, blindly slicing input_ids drops some
+        # of the `<|image_pad|>` / `<|video_pad|>` placeholder tokens, but the
+        # vision encoder still produces patch features for the *full* original
+        # image. The model's forward pass then crashes with
+        #   "Image features and image tokens do not match: tokens: X, features: Y".
+        # To avoid corrupting alignment we ask the caller (`__getitem__`) to
+        # resample a different index. Pure-text samples are still truncated
+        # normally (their information is salvageable).
+        if sequence_length > self.max_length and len(multi_modal_inputs) > 0:
+            logger.warning(
+                "MultiTurnSFTDataset: skipping sample %d (seq_len=%d > max_length=%d) "
+                "because truncation would break image/video token alignment.",
+                item, sequence_length, self.max_length,
+            )
+            raise _SkipSample()
+
         # Handle sequence length
         if self.pad_mode == DatasetPadMode.RIGHT:
             if sequence_length < self.max_length:

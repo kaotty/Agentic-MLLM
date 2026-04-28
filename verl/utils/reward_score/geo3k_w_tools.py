@@ -58,7 +58,7 @@ def compute_score(solution_str: str, ground_truth: str, **kwargs):
         f.write("!"*50 + "\n")
     w_acc = float(os.environ.get("REWARD_W_ACC", "1.0"))
     w_base_fmt = float(os.environ.get("REWARD_W_BASE_FMT", "0.1"))
-    w_tool_fmt = float(os.environ.get("REWARD_W_TOOL_FMT", "100.0"))
+    w_tool_fmt = float(os.environ.get("REWARD_W_TOOL_FMT", "1.0"))
     w_penalty = float(os.environ.get("REWARD_W_PENALTY", "0.5"))
 
     r_acc = acc_reward(solution_str, ground_truth)

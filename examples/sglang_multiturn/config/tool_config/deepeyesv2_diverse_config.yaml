@@ -52,7 +52,10 @@ tools:
       enable_global_rate_limit: true
       rate_limit: 120
       timeout: 30
-      retrieval_service_url: "${SEARCH_SERVICE_URL:}"
+      # OmegaConf env-var interpolation. Empty default → soft-fail in
+      # verl/tools/search_tool.py (returns "service unavailable" instead of
+      # crashing). Set SEARCH_SERVICE_URL=http://your-retrieval-host to opt in.
+      retrieval_service_url: ${oc.env:SEARCH_SERVICE_URL,""}
       topk: 5
       type: native
     tool_schema:
